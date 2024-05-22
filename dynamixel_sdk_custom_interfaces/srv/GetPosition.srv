@@ -1,6 +1,6 @@
 # Constants
 # Request
-uint8 id
 ---
 # Response
-int32 position
+int32 angle_1
+int32 angle_2

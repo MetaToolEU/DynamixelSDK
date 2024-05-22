@@ -22,17 +22,21 @@
 //
 // Open terminal #2 (run one of below commands at a time)
 // $ ros2 topic pub -1 /set_position dynamixel_sdk_custom_interfaces/SetPosition "{id: 1, position: 1000}"
-// $ ros2 service call /get_position dynamixel_sdk_custom_interfaces/srv/GetPosition "id: 1"
+// $ ros2 service call /get_position dynamixel_sdk_custom_interfaces/srv/GetPosition ""
 //
-// Author: Will Son
+// Original author: Will Son
+// Modified by: Fernando Moreno
 *******************************************************************************/
 
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <chrono>
+#include <functional>
 
 #include "dynamixel_sdk/dynamixel_sdk.h"
 #include "dynamixel_sdk_custom_interfaces/msg/set_position.hpp"
+#include "dynamixel_sdk_custom_interfaces/msg/tf_angles.hpp"
 #include "dynamixel_sdk_custom_interfaces/srv/get_position.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rcutils/cmdline_parser.h"
@@ -44,13 +48,35 @@
 #define ADDR_TORQUE_ENABLE 64
 #define ADDR_GOAL_POSITION 116
 #define ADDR_PRESENT_POSITION 132
+#define ADDR_PROFILE_VELOCITY 112
 
 // Protocol version
 #define PROTOCOL_VERSION 2.0  // Default Protocol version of DYNAMIXEL X series.
 
 // Default setting
+#define DXL1_ID                         1                   // Dynamixel ID: 1
+#define DXL2_ID                         2                   // Dynamixel ID: 2
 #define BAUDRATE 57600  // Default Baudrate of DYNAMIXEL X series
 #define DEVICE_NAME "/dev/ttyUSB0"  // [Linux]: "/dev/ttyUSB*", [Windows]: "COM*"
+
+// Angle constraints
+#define DXL1_ANGLE_LOW  -20
+#define DXL1_ANGLE_HIGH  20
+#define DXL2_ANGLE_LOW  -50
+#define DXL2_ANGLE_HIGH  50
+
+
+using namespace std::chrono_literals;
+
+int angleToPos(int x, int in_max = 360, int out_max = 4096, int offset = 2048)
+{
+  return round(x * (float)(out_max) / (in_max) + offset);
+}
+
+int PosToAngle(int x, int in_max = 4096, int out_max = 360, int offset = -180)
+{
+  return round(x * (float)(out_max) / (in_max) + offset);
+}
 
 dynamixel::PortHandler * portHandler;
 dynamixel::PacketHandler * packetHandler;
@@ -58,6 +84,8 @@ dynamixel::PacketHandler * packetHandler;
 uint8_t dxl_error = 0;
 uint32_t goal_position = 0;
 int dxl_comm_result = COMM_TX_FAIL;
+
+
 
 ReadWriteNode::ReadWriteNode()
 : Node("read_write_node")
@@ -79,18 +107,26 @@ ReadWriteNode::ReadWriteNode()
     {
       uint8_t dxl_error = 0;
 
-      // Position Value of X series is 4 byte data.
-      // For AX & MX(1.0) use 2 byte data(uint16_t) for the Position Value.
-      uint32_t goal_position = (unsigned int)msg->position;  // Convert int32 -> uint32
+      // Angle Constraints
+      if(msg->angle_1 < DXL1_ANGLE_LOW) msg->angle_1 = DXL1_ANGLE_LOW;
+      else if(msg->angle_1 > DXL1_ANGLE_HIGH) msg->angle_1 = DXL1_ANGLE_HIGH;
 
-      // Write Goal Position (length : 4 bytes)
-      // When writing 2 byte data to AX / MX(1.0), use write2ByteTxRx() instead.
+      if(msg->angle_2 < DXL2_ANGLE_LOW) msg->angle_2 = DXL2_ANGLE_LOW;
+      else if(msg->angle_2 > DXL2_ANGLE_HIGH) msg->angle_2 = DXL2_ANGLE_HIGH;
+
+      // Position Value of X series is 4 byte data.
+      uint32_t goal_position_1 = (unsigned int)angleToPos(msg->angle_1);  // Convert int32 -> uint32
+      uint32_t goal_position_2 = (unsigned int)angleToPos(msg->angle_2);  // Convert int32 -> uint32
+
+      
+
+      // Write Goal Position 1 (length : 4 bytes)
       dxl_comm_result =
       packetHandler->write4ByteTxRx(
         portHandler,
-        (uint8_t) msg->id,
+        (uint8_t) DXL1_ID,
         ADDR_GOAL_POSITION,
-        goal_position,
+        goal_position_1,
         &dxl_error
       );
 
@@ -99,42 +135,112 @@ ReadWriteNode::ReadWriteNode()
       } else if (dxl_error != 0) {
         RCLCPP_INFO(this->get_logger(), "%s", packetHandler->getRxPacketError(dxl_error));
       } else {
-        RCLCPP_INFO(this->get_logger(), "Set [ID: %d] [Goal Position: %d]", msg->id, msg->position);
+        RCLCPP_INFO(this->get_logger(), "Set [ID: %d] [Goal Angle: %d]", DXL1_ID, msg->angle_1);
       }
+
+      // Write Goal Position 2 (length : 4 bytes)
+      dxl_comm_result =
+      packetHandler->write4ByteTxRx(
+        portHandler,
+        (uint8_t) DXL2_ID,
+        ADDR_GOAL_POSITION,
+        goal_position_2,
+        &dxl_error
+      );
+
+      if (dxl_comm_result != COMM_SUCCESS) {
+        RCLCPP_INFO(this->get_logger(), "%s", packetHandler->getTxRxResult(dxl_comm_result));
+      } else if (dxl_error != 0) {
+        RCLCPP_INFO(this->get_logger(), "%s", packetHandler->getRxPacketError(dxl_error));
+      } else {
+        RCLCPP_INFO(this->get_logger(), "Set [ID: %d] [Goal Angle: %d]", DXL2_ID, msg->angle_2);
+      }
+
     }
     );
 
+  //publisher
+  tf_angles_publisher_ = this->create_publisher<TfAngles>("tf_angles", QOS_RKL10V);
+  timer_ = this->create_wall_timer( 20ms, std::bind(&ReadWriteNode::timer_callback, this));
+
+  
   auto get_present_position =
     [this](
     const std::shared_ptr<GetPosition::Request> request,
     std::shared_ptr<GetPosition::Response> response) -> void
     {
-      // Read Present Position (length : 4 bytes) and Convert uint32 -> int32
-      // When reading 2 byte data from AX / MX(1.0), use read2ByteTxRx() instead.
+      // Read Present Position 1 (length : 4 bytes) and Convert uint32 -> int32
       dxl_comm_result = packetHandler->read4ByteTxRx(
         portHandler,
-        (uint8_t) request->id,
+        (uint8_t) DXL1_ID,
         ADDR_PRESENT_POSITION,
-        reinterpret_cast<uint32_t *>(&present_position),
+        reinterpret_cast<uint32_t *>(&present_position_1),
+        &dxl_error
+      );
+      // Read Present Position 2 (length : 4 bytes) and Convert uint32 -> int32
+      dxl_comm_result = packetHandler->read4ByteTxRx(
+        portHandler,
+        (uint8_t) DXL2_ID,
+        ADDR_PRESENT_POSITION,
+        reinterpret_cast<uint32_t *>(&present_position_2),
         &dxl_error
       );
 
       RCLCPP_INFO(
         this->get_logger(),
-        "Get [ID: %d] [Present Position: %d]",
-        request->id,
-        present_position
+        "Get [ID: %d] [Present Angle: %d]",
+        DXL1_ID,
+        PosToAngle(present_position_1)
       );
 
-      response->position = present_position;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Get [ID: %d] [Present Angle: %d]",
+        DXL2_ID,
+        PosToAngle(present_position_2)
+      );
+
+      response->angle_1 = PosToAngle(present_position_1);
+      response->angle_2 = PosToAngle(present_position_2);
+
     };
 
   get_position_server_ = create_service<GetPosition>("get_position", get_present_position);
+  
+
 }
 
 ReadWriteNode::~ReadWriteNode()
 {
 }
+
+void ReadWriteNode::timer_callback()
+{
+    dynamixel_sdk_custom_interfaces::msg::TfAngles msg;
+    // Read Present Position 1 (length : 4 bytes) and Convert uint32 -> int32
+    // uint32_t present_position_1, present_position_2;
+    dxl_comm_result = packetHandler->read4ByteTxRx(
+      portHandler,
+      (uint8_t) DXL1_ID,
+      ADDR_PRESENT_POSITION,
+      reinterpret_cast<uint32_t *>(&present_position_1),
+      &dxl_error
+    );
+    // Read Present Position 2 (length : 4 bytes) and Convert uint32 -> int32
+    dxl_comm_result = packetHandler->read4ByteTxRx(
+      portHandler,
+      (uint8_t) DXL2_ID,
+      ADDR_PRESENT_POSITION,
+      reinterpret_cast<uint32_t *>(&present_position_2),
+      &dxl_error
+    );
+
+    msg.tf_angle_1 = PosToAngle(present_position_1);
+    msg.tf_angle_2 = PosToAngle(present_position_2);
+
+    tf_angles_publisher_->publish(msg);
+}
+
 
 void setupDynamixel(uint8_t dxl_id)
 {
@@ -152,6 +258,9 @@ void setupDynamixel(uint8_t dxl_id)
   } else {
     RCLCPP_INFO(rclcpp::get_logger("read_write_node"), "Succeeded to set Position Control Mode.");
   }
+
+  // Change Dynamixel Profile Velocity
+  packetHandler->write4ByteTxRx(portHandler, dxl_id, ADDR_PROFILE_VELOCITY, 33);
 
   // Enable Torque of DYNAMIXEL
   dxl_comm_result = packetHandler->write1ByteTxRx(

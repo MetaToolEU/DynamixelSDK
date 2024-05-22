@@ -15,9 +15,11 @@ find_package(ament_cmake REQUIRED)
 find_package(dynamixel_sdk REQUIRED)
 find_package(dynamixel_sdk_custom_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 include_directories(include)
 
+# read_write_node
 # Build
 add_executable(read_write_node src/read_write_node.cpp)
 ament_target_dependencies(read_write_node
@@ -26,9 +28,39 @@ ament_target_dependencies(read_write_node
   rclcpp
 )
 
+# scan_test
+# Build
+add_executable(scan_test src/scan_test.cpp)
+ament_target_dependencies(scan_test
+  dynamixel_sdk_custom_interfaces
+  dynamixel_sdk
+  rclcpp
+)
+
+# static_tf_publisher
+# Build
+add_executable(static_tf_publisher src/static_tf_publisher.cpp)
+ament_target_dependencies(static_tf_publisher
+  dynamixel_sdk_custom_interfaces
+  tf2_ros
+  rclcpp
+)
+
+# set_position_publisher
+# Build
+add_executable(set_position_publisher src/set_position_publisher.cpp)
+ament_target_dependencies(set_position_publisher
+  dynamixel_sdk_custom_interfaces
+  tf2_ros
+  rclcpp
+)
+
 # Install
 install(TARGETS
   read_write_node
+  scan_test
+  static_tf_publisher
+  set_position_publisher
   DESTINATION lib/${PROJECT_NAME}
 )
 
